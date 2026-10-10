@@ -63,9 +63,11 @@ warnings.filterwarnings("ignore")
 # ──────────────────────────────────────────────────────────────────────────────
 # 1.  Configuration
 # ──────────────────────────────────────────────────────────────────────────────
-OUTPUTS_DIR   = "outputs"
+# Resolve all paths relative to this file so the module works from any CWD
+_THIS_DIR     = os.path.dirname(os.path.abspath(__file__))
+OUTPUTS_DIR   = os.path.join(_THIS_DIR, "outputs")
 PLOTS_DIR     = os.path.join(OUTPUTS_DIR, "shap_plots")
-DATA_PATH     = "patient_churn_dataset.csv.xls"
+DATA_PATH     = os.path.join(_THIS_DIR, "patient_churn_dataset.csv.xls")
 SNAPSHOT_DATE = pd.Timestamp("2026-08-13")
 RANDOM_STATE  = 42
 TEST_SIZE     = 0.20
@@ -156,12 +158,14 @@ def _apply_feature_engineering(df_raw: pd.DataFrame) -> pd.DataFrame:
 # 3.  Loaders
 # ──────────────────────────────────────────────────────────────────────────────
 def load_model():
-    """Load the saved best model (XGBClassifier)."""
+    """Load the saved best model (XGBClassifier) with strict validation."""
+    from industry_registry import _validate_is_xgboost_model
     path = os.path.join(OUTPUTS_DIR, "churn_model.pkl")
     if not os.path.exists(path):
         path = os.path.join(OUTPUTS_DIR, "best_model.pkl")
     with open(path, "rb") as f:
         model = pickle.load(f)
+    _validate_is_xgboost_model(model)
     return model
 
 
@@ -365,22 +369,20 @@ _cache = {}
 def _get_loaded_assets():
     """
     Lazily load and cache model, preprocessor, feature names, raw dataset,
-    SHAP explainer, and full SHAP values.  Subsequent calls return instantly.
+    SHAP explainer, and full SHAP values. Subsequent calls return instantly.
+    Integrates with IndustryRegistry to guarantee a single active XGBoost model in memory.
     """
     if "ready" in _cache:
         return _cache
 
-    print("[SHAP] Loading assets ...")
-    model        = load_model()
-    preprocessor, num_cols, nominal_cats = load_preprocessor()
-    feature_names = load_feature_names()
-    raw_df       = load_raw_dataset()
-
-    # Build background matrix from training data (same split as preprocessing.py)
-    X_train = pd.read_csv(os.path.join(OUTPUTS_DIR, "X_train.csv")).values
-
-    # Build explainer
-    explainer = build_shap_explainer(model, None)
+    from industry_registry import get_registry
+    print("[SHAP] Sourcing active XGBoost assets from IndustryRegistry ...")
+    bundle = get_registry().get_active_bundle()
+    model = bundle.model
+    preprocessor = bundle.preprocessor
+    feature_names = bundle.feature_names
+    explainer = bundle.explainer
+    raw_df = load_raw_dataset()
 
     # Pre-compute SHAP values for the full test set (used for global plots)
     X_test = pd.read_csv(os.path.join(OUTPUTS_DIR, "X_test.csv")).values
@@ -389,14 +391,14 @@ def _get_loaded_assets():
     print(f"[SHAP] SHAP values shape: {shap_values_test.shape}")
 
     _cache.update({
-        "ready":          True,
-        "model":          model,
-        "preprocessor":   preprocessor,
-        "feature_names":  feature_names,
-        "raw_df":         raw_df,
-        "explainer":      explainer,
+        "ready": True,
+        "model": model,
+        "preprocessor": preprocessor,
+        "feature_names": feature_names,
+        "raw_df": raw_df,
+        "explainer": explainer,
         "shap_values_test": shap_values_test,
-        "X_test":         X_test,
+        "X_test": X_test,
     })
     return _cache
 

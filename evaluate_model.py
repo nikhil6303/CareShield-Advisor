@@ -64,12 +64,16 @@ X_test        = pd.read_csv(f"{OUTPUTS_DIR}/X_test.csv").values
 y_test        = pd.read_csv(f"{OUTPUTS_DIR}/y_test.csv").squeeze().values
 feature_names = pd.read_csv(f"{OUTPUTS_DIR}/feature_names.csv")["feature"].tolist()
 
-with open(f"{OUTPUTS_DIR}/model_logistic_regression.pkl", "rb") as f:
-    lr_model = pickle.load(f)
-with open(f"{OUTPUTS_DIR}/model_random_forest.pkl", "rb") as f:
-    rf_model = pickle.load(f)
-with open(f"{OUTPUTS_DIR}/model_xgboost.pkl", "rb") as f:
+model_path = f"{OUTPUTS_DIR}/churn_model.pkl"
+if not os.path.exists(model_path):
+    model_path = f"{OUTPUTS_DIR}/best_model.pkl"
+
+with open(model_path, "rb") as f:
     xgb_model = pickle.load(f)
+
+# Strict XGBoost validation
+from industry_registry import _validate_is_xgboost_model
+_validate_is_xgboost_model(xgb_model)
 
 # Load saved metrics JSON (produced by train_model.py)
 with open(f"{OUTPUTS_DIR}/metrics_all_models.json", "r") as f:
@@ -77,12 +81,10 @@ with open(f"{OUTPUTS_DIR}/metrics_all_models.json", "r") as f:
 
 print(f"    Test set: {X_test.shape[0]} rows x {X_test.shape[1]} features")
 print(f"    Test churn rate: {y_test.mean()*100:.1f}%")
-print(f"    Best model (by train_model.py): {saved_metrics['best_model']}")
+print(f"    Model Algorithm: XGBoost (exclusive)")
 
 models = {
-    "Logistic Regression": lr_model,
-    "Random Forest":       rf_model,
-    "XGBoost":             xgb_model,
+    "XGBoost": xgb_model,
 }
 
 
@@ -155,26 +157,16 @@ for name, model in models.items():
 
 
 # ------------------------------------------------------------------------------
-# 3.  Feature importances (top 15 per tree-based model)
+# 3.  XGBoost Feature Importances (Top 15)
 # ------------------------------------------------------------------------------
 print(f"\n\n{'-'*72}")
-print("  FEATURE IMPORTANCES (Top 15)")
+print("  XGBOOST FEATURE IMPORTANCES (Top 15)")
 print(f"{'-'*72}")
 
-for name in ["Random Forest", "XGBoost"]:
-    model = models[name]
-    imp   = model.feature_importances_
-    idx   = np.argsort(imp)[::-1][:15]
-    print(f"\n  {name}:")
-    for rank, i in enumerate(idx, 1):
-        print(f"    {rank:2d}. {feature_names[i]:<35} {imp[i]:.4f}")
-
-# LR coefficients
-lr_coef = np.abs(lr_model.coef_[0])
-lr_idx  = np.argsort(lr_coef)[::-1][:15]
-print(f"\n  Logistic Regression (|coefficients|):")
-for rank, i in enumerate(lr_idx, 1):
-    print(f"    {rank:2d}. {feature_names[i]:<35} {lr_coef[i]:.4f}")
+imp = xgb_model.feature_importances_
+idx = np.argsort(imp)[::-1][:15]
+for rank, i in enumerate(idx, 1):
+    print(f"    {rank:2d}. {feature_names[i]:<35} {imp[i]:.4f}")
 
 
 # ------------------------------------------------------------------------------

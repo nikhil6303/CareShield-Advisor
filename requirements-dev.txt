@@ -1,0 +1,4 @@
+# Development and Testing Dependencies for CareShield Advisor
+-r requirements.txt
+pytest==8.3.3
+requests==2.34.2

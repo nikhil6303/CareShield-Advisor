@@ -28,6 +28,8 @@ import os
 import json
 import logging
 import re
+import time
+import threading
 import warnings
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -41,8 +43,15 @@ warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# Initialize Flask app
-app = Flask(__name__, static_folder='.', static_url_path='')
+# Resolve the project root relative to this file so paths work from any CWD
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Initialize Flask app — static_folder set to project root so /index.html is served correctly
+app = Flask(__name__, static_folder=_THIS_DIR, static_url_path='')
+
+# Limit file upload size to 10 MB to prevent memory exhaustion from large uploads
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10 MB
+
 # Configure CORS for local development and deployed frontend URLs
 frontend_env = os.environ.get("FRONTEND_URL", "").strip()
 allowed_origins = [
@@ -74,6 +83,29 @@ else:
             "allow_headers": ["Content-Type", "Authorization"]
         }
     })
+
+# ---------------------------------------------------------------------------
+# Simple in-memory rate limiter for expensive AI explanation endpoints.
+# Uses a token-bucket approach with no external dependencies.
+# ---------------------------------------------------------------------------
+_AI_RATE_LOCK = threading.Lock()
+_AI_RATE_CALLS: list = []      # list of timestamps of recent AI calls
+AI_RATE_LIMIT = int(os.environ.get("AI_RATE_LIMIT", "10"))   # max calls per window
+AI_RATE_WINDOW = int(os.environ.get("AI_RATE_WINDOW", "60"))  # window in seconds
+
+
+def _ai_rate_check() -> bool:
+    """Return True if the request is within the allowed rate, False if rate-limited."""
+    now = time.time()
+    with _AI_RATE_LOCK:
+        # Purge timestamps outside the current window
+        cutoff = now - AI_RATE_WINDOW
+        while _AI_RATE_CALLS and _AI_RATE_CALLS[0] < cutoff:
+            _AI_RATE_CALLS.pop(0)
+        if len(_AI_RATE_CALLS) >= AI_RATE_LIMIT:
+            return False
+        _AI_RATE_CALLS.append(now)
+        return True
 
 ALLOWED_UPLOAD_EXTENSIONS = {"csv", "xlsx", "xls"}
 REQUIRED_FEATURE_COLUMNS = [
@@ -123,7 +155,7 @@ class DatasetValidationError(ValueError):
 # Serve index.html at the root so the app works over http:// without file://
 @app.route('/')
 def serve_index():
-    return send_from_directory('.', 'index.html')
+    return send_from_directory(_THIS_DIR, 'index.html')
 
 # ------------------------------------------------------------------------------
 # 1.  Asset Loading & Pre-caching
@@ -131,7 +163,8 @@ def serve_index():
 logger.info("Initializing API and loading models/explainers...")
 
 try:
-    # Import functions and assets from shap_explainer and retention_advisor
+    # Import functions and assets from industry_registry, shap_explainer and retention_advisor
+    from industry_registry import get_registry, _validate_is_xgboost_model
     from shap_explainer import (
         _get_loaded_assets,
         _apply_feature_engineering,
@@ -141,15 +174,21 @@ try:
     )
     from retention_advisor import get_retention_recommendations
 
-    # Get cached assets (loads model, preprocessor, explainer, raw_df)
+    # Initialize lightweight industry registry and active XGBoost bundle
+    registry = get_registry()
+    active_bundle = registry.get_active_bundle()
+    model = active_bundle.model
+    preprocessor = active_bundle.preprocessor
+    explainer = active_bundle.explainer
+    feature_names = active_bundle.feature_names
+
+    # Strict XGBoost exclusive validation
+    _validate_is_xgboost_model(model)
+
     assets = _get_loaded_assets()
-    model = assets["model"]
-    preprocessor = assets["preprocessor"]
-    explainer = assets["explainer"]
     raw_df = assets["raw_df"]
-    feature_names = assets["feature_names"]
     
-    logger.info("Machine learning models, preprocessing pipelines, and SHAP TreeExplainer loaded successfully.")
+    logger.info("XGBoost churn prediction model, preprocessing pipeline, and SHAP TreeExplainer loaded successfully.")
 
     # --------------------------------------------------------------------------
     # Pre-compute & Cache All Predictions and SHAP Values for Dataset
@@ -334,6 +373,105 @@ def get_member_detail(member_id):
     return jsonify(cached)
 
 
+# ------------------------------------------------------------------------------
+# Ollama / Qwen3 1.7B Local AI Explanation Endpoints
+# ------------------------------------------------------------------------------
+
+@app.route("/ai/status", methods=["GET"])
+def ai_status():
+    """
+    Returns the operational status of the local Ollama Qwen3 1.7B service.
+    Fast non-blocking check with a 2.5-second timeout.
+    """
+    from ollama_service import check_ollama_health, get_ollama_config
+    health = check_ollama_health()
+    config = get_ollama_config()
+    return jsonify({
+        "status": "online" if health.get("available") else "offline",
+        "health": health,
+        "config": config,
+        "role": "Explanation and retention advisory synthesis only (XGBoost performs all predictions)",
+    })
+
+
+@app.route("/member/<member_id>/ai-explain", methods=["POST"])
+def member_ai_explain(member_id):
+    """
+    Generates an evidence-based narrative explanation for a specific member
+    using local Qwen3 1.7B via Ollama. POST-only to prevent crawlers from
+    triggering expensive LLM inference via unintentional GET requests.
+    Does not alter XGBoost churn probability.
+    """
+    if not _ai_rate_check():
+        return jsonify({
+            "success": False,
+            "error": "AI explanation rate limit reached. Please wait before requesting another explanation."
+        }), 429
+
+    cached = MEMBER_CACHE.get(member_id)
+    if not cached:
+        return jsonify({"error": f"Member with ID '{member_id}' not found."}), 404
+
+    from ollama_service import generate_ai_explanation
+    active_ind = registry.get_active_bundle().schema.display_name
+
+    try:
+        explanation = generate_ai_explanation(
+            member_id=member_id,
+            churn_probability=cached["churn_probability"],
+            risk_level=cached["risk_level"],
+            shap_drivers=cached["drivers"],
+            member_info=cached["member_info"],
+            industry_name=active_ind,
+        )
+        return jsonify(explanation)
+    except Exception as exc:
+        logger.error("AI explanation error for member %s: %s", member_id, exc, exc_info=True)
+        return jsonify({"success": False, "error": "AI explanation service encountered an internal error."}), 500
+
+
+@app.route("/explain/ai", methods=["POST"])
+def explain_custom_ai():
+    """
+    Generates an evidence-based narrative explanation for custom/simulator member inputs.
+    Does not block or alter XGBoost predictions.
+    Rate-limited to prevent runaway LLM inference.
+    """
+    if not _ai_rate_check():
+        return jsonify({
+            "success": False,
+            "error": "AI explanation rate limit reached. Please wait before requesting another explanation."
+        }), 429
+
+    data = request.get_json(silent=True) or {}
+    prob = data.get("churn_probability")
+    risk_level = data.get("risk_level")
+    drivers = data.get("drivers", [])
+    member_info = data.get("member_info", {})
+
+    if prob is None or not risk_level:
+        return jsonify({
+            "error": "Fields 'churn_probability' and 'risk_level' are required for AI explanation."
+        }), 400
+
+    from ollama_service import generate_ai_explanation
+    active_ind = registry.get_active_bundle().schema.display_name
+
+    try:
+        explanation = generate_ai_explanation(
+            member_id=data.get("member_id"),
+            churn_probability=float(prob),
+            risk_level=str(risk_level),
+            shap_drivers=drivers,
+            member_info=member_info,
+            industry_name=active_ind,
+        )
+        return jsonify(explanation)
+    except Exception as exc:
+        logger.error("Custom AI explanation error: %s", exc, exc_info=True)
+        return jsonify({"success": False, "error": "AI explanation service encountered an internal error."}), 500
+
+
 @app.route("/analytics", methods=["GET"])
 def get_analytics():
     """
@@ -349,11 +487,61 @@ def get_analytics():
     return jsonify(analytics_data)
 
 
+@app.route("/industries", methods=["GET"])
+def get_industries():
+    """
+    Returns the lightweight registry of supported industries,
+    displaying the active XGBoost model configuration.
+    """
+    return jsonify({
+        "supported_industries": registry.get_supported_industries(),
+        "active_industry": registry.get_active_industry_id(),
+        "algorithm": "XGBoost",
+        "single_model_in_memory": True,
+    })
+
+
+@app.route("/industry/active", methods=["GET"])
+def get_active_industry():
+    """Returns active industry metadata and schema."""
+    active_bundle = registry.get_active_bundle()
+    return jsonify({
+        "industry_id": active_bundle.schema.industry_id,
+        "display_name": active_bundle.schema.display_name,
+        "description": active_bundle.schema.description,
+        "algorithm": active_bundle.schema.algorithm,
+        "features": active_bundle.feature_names,
+        "metadata": active_bundle.schema.metadata
+    })
+
+
+@app.route("/industry/select", methods=["POST"])
+def select_industry():
+    """
+    Controlled industry switching endpoint.
+    Guarantees only ONE industry-specific model is active in memory at a time.
+    """
+    data = request.get_json(silent=True) or {}
+    industry_id = data.get("industry_id", "").strip().lower()
+    if not industry_id:
+        return jsonify({"error": "Field 'industry_id' is required."}), 400
+    try:
+        new_bundle = registry.load_industry(industry_id)
+        return jsonify({
+            "success": True,
+            "message": f"Active industry switched to '{industry_id}'.",
+            "industry": new_bundle.schema.display_name,
+            "algorithm": new_bundle.schema.algorithm
+        })
+    except (ValueError, FileNotFoundError, TypeError) as e:
+        return jsonify({"error": str(e)}), 400
+
+
 @app.route("/predict", methods=["POST"])
 def predict():
     """
     Accepts member feature data via POST and returns predictions, SHAP drivers,
-    and retention recommendations. Runs dynamically using the saved pipeline.
+    and retention recommendations. Runs dynamically using the active XGBoost pipeline.
     
     Input JSON structure example:
     {
@@ -383,42 +571,28 @@ def predict():
         if not data:
             return jsonify({"error": "Missing input JSON payload"}), 400
             
+        # Get active industry bundle
+        current_bundle = registry.get_active_bundle()
+
         # Handle default fallbacks for missing columns to ensure API robustness
-        DEFAULTS = {
-            "Age": 54, "Gender": "Male", "State": "MI", "Tenure_Months": 60,
-            "Specialty": "Family Medicine", "Insurance_Type": "Private",
-            "Visits_Last_Year": 8, "Missed_Appointments": 2,
-            "Days_Since_Last_Visit": 363, "Last_Interaction_Date": "2025-06-03",
-            "Overall_Satisfaction": 3.2, "Wait_Time_Satisfaction": 3.3,
-            "Staff_Satisfaction": 3.5, "Provider_Rating": 3.8,
-            "Avg_Out_Of_Pocket_Cost": 716, "Billing_Issues": 0,
-            "Portal_Usage": 0, "Referrals_Made": 1, "Distance_To_Facility_Miles": 25.0
-        }
+        DEFAULTS = current_bundle.schema.defaults
         
         # Merge input data with defaults
         inputs = {}
         for k, default_val in DEFAULTS.items():
             inputs[k] = data.get(k, default_val)
             
-        # Represent as a Pandas Series (excluding PatientID/Churned)
-        row_series = pd.Series(inputs)
+        # Single-pass preprocessing and feature engineering (no redundant dataframes)
+        X_member, row_fe = current_bundle.preprocess_single(inputs)
         
-        # Preprocess using pipeline
-        X_member = preprocess_member_row(row_series, preprocessor)
-        
-        # Predict probability
-        prob = float(model.predict_proba(X_member)[0, 1])
+        # Predict probability strictly using XGBoost
+        prob = float(current_bundle.predict_proba(X_member)[0])
         risk_lvl = assign_risk_level(prob)
         
-        # Compute SHAP values for this custom input
-        shap_vals = explainer.shap_values(X_member)[0]
+        # Compute SHAP values for this custom input via cached TreeExplainer
+        shap_vals = current_bundle.explain(X_member)[0]
         abs_shap = np.abs(shap_vals)
         top_indices = np.argsort(abs_shap)[::-1]
-        
-        # Extract engineered features for OHE feature checks
-        cols_to_drop = [c for c in ["PatientID", "Churned"] if c in row_series.index]
-        row_df = pd.DataFrame([row_series]).drop(columns=cols_to_drop, errors="ignore")
-        row_fe = _apply_feature_engineering(row_df).iloc[0].to_dict()
         
         # Format top 5 drivers
         drivers = []
@@ -463,10 +637,10 @@ def predict():
             "drivers": drivers,
             "recommendations": recommendations
         })
-        
+
     except Exception as e:
-        logger.error(f"Error during dynamic prediction: {str(e)}", exc_info=True)
-        return jsonify({"error": f"Internal prediction failure: {str(e)}"}), 500
+        logger.error("Error during dynamic prediction: %s", str(e), exc_info=True)
+        return jsonify({"error": "Prediction service encountered an internal error. Check server logs."}), 500
 
 
 def _json_error(message, status_code=400, **extra):
@@ -687,13 +861,14 @@ def _process_dataframe_response(df_uploaded):
     # Clean and normalize uploaded dataset
     df_clean = _normalize_and_clean_dataframe(df_uploaded)
 
-    # Preprocessing & Prediction
+    # Preprocessing & Prediction exclusively using active XGBoost bundle
+    active_bundle = registry.get_active_bundle()
     cols_to_drop = [c for c in ["PatientID", "Churned"] if c in df_clean.columns]
     df_features = df_clean.drop(columns=cols_to_drop)
-    df_fe = _apply_feature_engineering(df_features)
-    X_processed = preprocessor.transform(df_fe)
-    probs = model.predict_proba(X_processed)[:, 1]
-    shap_vals = explainer.shap_values(X_processed)
+    df_fe = active_bundle.apply_feature_engineering(df_features)
+    X_processed = active_bundle.preprocessor.transform(df_fe)
+    probs = active_bundle.predict_proba(X_processed)
+    shap_vals = active_bundle.explain(X_processed)
 
     # Build Cache
     new_member_cache = {}
@@ -905,11 +1080,11 @@ def predict_file():
         df_uploaded = _read_uploaded_dataframe(file)
         return _process_dataframe_response(df_uploaded)
     except DatasetValidationError as exc:
-        logger.warning(f"Dataset validation failed: {exc}")
+        logger.warning("Dataset validation failed: %s", exc)
         return _json_error(str(exc))
     except Exception as e:
-        logger.error(f"Error processing uploaded file: {str(e)}", exc_info=True)
-        return _json_error(f"Dataset analysis failed: {str(e)}", status_code=500)
+        logger.error("Error processing uploaded file: %s", str(e), exc_info=True)
+        return _json_error("Dataset analysis failed due to an internal error. Check server logs.", status_code=500)
 
 
 
@@ -935,8 +1110,8 @@ def retention_recommendations():
         )
         return jsonify(recs)
     except Exception as e:
-        logger.error(f"Error in dynamic recommendations endpoint: {str(e)}", exc_info=True)
-        return jsonify({"error": f"Failed to compute recommendations: {str(e)}"}), 500
+        logger.error("Error in dynamic recommendations endpoint: %s", str(e), exc_info=True)
+        return jsonify({"error": "Failed to compute recommendations due to an internal error."}), 500
 
 
 @app.route("/load-demo", methods=["GET"])

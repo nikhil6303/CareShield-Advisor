@@ -44,8 +44,6 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import StratifiedKFold, cross_validate
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score,
@@ -53,6 +51,7 @@ from sklearn.metrics import (
     classification_report,
 )
 from xgboost import XGBClassifier
+from industry_registry import _validate_is_xgboost_model
 
 warnings.filterwarnings("ignore")
 
@@ -159,62 +158,9 @@ def run_cv(model, X_tr, y_tr, name):
 
 
 # ------------------------------------------------------------------------------
-# 4.  MODEL A -- Logistic Regression (Baseline)
+# 4.  XGBoost Training (Hyperparameter Tuning via Stratified K-Fold CV)
 # ------------------------------------------------------------------------------
-# Decision: class_weight='balanced' adjusts loss weights proportional to
-# inverse class frequency. C=0.1 gives mild L2 regularisation to avoid
-# overfitting on a dataset this size.
-# ------------------------------------------------------------------------------
-print("\n\n[2] Training Model A -- Logistic Regression (baseline) …")
-lr = LogisticRegression(
-    C=0.1,
-    penalty="l2",
-    class_weight="balanced",   # handles 68/32 imbalance via loss reweighting
-    solver="lbfgs",
-    max_iter=2000,
-    random_state=RANDOM_STATE,
-)
-lr.fit(X_train, y_train)
-lr_cv      = run_cv(lr, X_train, y_train, "Logistic Regression")
-lr_metrics = evaluate_on_test(lr, X_train, X_test, y_train, y_test, "Logistic Regression")
-lr_metrics.update(lr_cv)
-
-
-# ------------------------------------------------------------------------------
-# 5.  MODEL B -- Random Forest
-# ------------------------------------------------------------------------------
-# Decision: class_weight='balanced_subsample' rebalances within each bootstrap
-# sample drawn during training, which is more appropriate than global weighting
-# for ensemble methods. n_estimators=300 is sufficient for a 2 K-row dataset.
-# max_features='sqrt' is the standard for classification trees.
-# ------------------------------------------------------------------------------
-print("\n\n[3] Training Model B -- Random Forest …")
-rf = RandomForestClassifier(
-    n_estimators=300,
-    max_depth=10,
-    min_samples_leaf=8,
-    max_features="sqrt",
-    class_weight="balanced_subsample",  # balances within each bootstrap sample
-    random_state=RANDOM_STATE,
-    n_jobs=-1,
-)
-rf.fit(X_train, y_train)
-rf_cv      = run_cv(rf, X_train, y_train, "Random Forest")
-rf_metrics = evaluate_on_test(rf, X_train, X_test, y_train, y_test, "Random Forest")
-rf_metrics.update(rf_cv)
-
-
-# ------------------------------------------------------------------------------
-# 6.  MODEL C -- XGBoost (with lightweight hyperparameter tuning)
-# ------------------------------------------------------------------------------
-# Decision:
-#   scale_pos_weight = n_neg / n_pos tells XGBoost to penalise missed positives
-#   proportionally -- correct way to handle imbalance in gradient boosting.
-#   eval_metric="auc" aligns training objective with our primary evaluation metric.
-#   We run a small manual grid (9 combinations) instead of GridSearchCV to keep
-#   compute light on a 2 K-row dataset.
-# ------------------------------------------------------------------------------
-print("\n\n[4] Training Model C -- XGBoost (lightweight hyperparameter tuning) …")
+print("\n\n[2] Training XGBoost (exclusive churn prediction algorithm) …")
 
 xgb_param_grid = [
     {"n_estimators": 200, "learning_rate": 0.05,  "max_depth": 4, "subsample": 0.8},
@@ -273,46 +219,24 @@ best_xgb = XGBClassifier(
     verbosity=0,
 )
 best_xgb.fit(X_train, y_train)
+
+# Strictly validate that the trained model is indeed XGBoost
+_validate_is_xgboost_model(best_xgb)
+
 xgb_cv      = run_cv(best_xgb, X_train, y_train, "XGBoost")
 xgb_metrics = evaluate_on_test(best_xgb, X_train, X_test, y_train, y_test, "XGBoost")
 xgb_metrics.update(xgb_cv)
 xgb_metrics["best_hyperparameters"] = best_xgb_params
 
-
-# ------------------------------------------------------------------------------
-# 7.  Select Best Model (ROC-AUC primary, F1 tiebreaker)
-# ------------------------------------------------------------------------------
 all_metrics = {
-    "Logistic Regression": lr_metrics,
-    "Random Forest":       rf_metrics,
-    "XGBoost":             xgb_metrics,
+    "XGBoost": xgb_metrics,
 }
+best_model_name = "XGBoost"
+best_model_object = best_xgb
 
-model_objects = {
-    "Logistic Regression": lr,
-    "Random Forest":       rf,
-    "XGBoost":             best_xgb,
-}
-
-# Sort by ROC-AUC desc, then F1 desc
-ranked = sorted(
-    all_metrics.items(),
-    key=lambda kv: (kv[1]["roc_auc"], kv[1]["f1"]),
-    reverse=True,
-)
-best_model_name   = ranked[0][0]
-best_model_object = model_objects[best_model_name]
-
-print(f"\n\n[5] BEST MODEL -> {best_model_name}")
-print(f"     ROC-AUC = {all_metrics[best_model_name]['roc_auc']:.4f}")
-print(f"     F1      = {all_metrics[best_model_name]['f1']:.4f}")
-
-
-# ------------------------------------------------------------------------------
-# 8.  Comparison Table
-# ------------------------------------------------------------------------------
+# Print Evaluation Table
 print("\n\n" + "=" * 70)
-print("  MODEL COMPARISON TABLE (Test Set, Threshold = 0.50)")
+print("  XGBOOST EVALUATION METRICS (Test Set, Threshold = 0.50)")
 print("=" * 70)
 header = (
     f"{'Model':<22} {'Accuracy':>9} {'Precision':>10} "
@@ -320,28 +244,21 @@ header = (
 )
 print(header)
 print("-" * 70)
-for name, m in all_metrics.items():
-    mark = " *" if name == best_model_name else ""
-    print(
-        f"{name:<22} "
-        f"{m['accuracy']*100:>8.2f}% "
-        f"{m['precision']:>10.4f} "
-        f"{m['recall']:>8.4f} "
-        f"{m['f1']:>8.4f} "
-        f"{m['roc_auc']:>9.4f} "
-        f"{m['cv_roc_auc_mean']:>8.4f}"
-        f"{mark}"
-    )
+print(
+    f"{'XGBoost':<22} "
+    f"{xgb_metrics['accuracy']*100:>8.2f}% "
+    f"{xgb_metrics['precision']:>10.4f} "
+    f"{xgb_metrics['recall']:>8.4f} "
+    f"{xgb_metrics['f1']:>8.4f} "
+    f"{xgb_metrics['roc_auc']:>9.4f} "
+    f"{xgb_metrics['cv_roc_auc_mean']:>8.4f} *"
+)
 print("=" * 70)
-print("  * = Selected best model (highest ROC-AUC, F1 as tiebreaker)")
 
-
-# ------------------------------------------------------------------------------
-# 9.  Predictive Signal Analysis
-# ------------------------------------------------------------------------------
-best_auc = all_metrics[best_model_name]["roc_auc"]
-best_f1  = all_metrics[best_model_name]["f1"]
-best_rec = all_metrics[best_model_name]["recall"]
+# Predictive Signal Analysis
+best_auc = xgb_metrics["roc_auc"]
+best_f1  = xgb_metrics["f1"]
+best_rec = xgb_metrics["recall"]
 
 print("\n\n" + "=" * 70)
 print("  PREDICTIVE SIGNAL ANALYSIS")
@@ -375,49 +292,33 @@ print(f"  Best ROC-AUC   : {best_auc:.4f}")
 print(f"  Best F1-Score  : {best_f1:.4f}")
 print(f"  Best Recall    : {best_rec:.4f}")
 print(f"\n  Analysis       : {signal_detail}")
-print(f"\n  Class imbalance: 68.35% churn. Models using class_weight='balanced'")
-print(f"  and scale_pos_weight give fair evaluation across both classes.")
-print(f"  Accuracy alone is misleading here -- a naive 'predict all churn'")
-print(f"  model would reach ~68% accuracy. ROC-AUC and F1 are the right metrics.")
+print(f"\n  Class imbalance: 68.35% churn. scale_pos_weight gives fair evaluation across both classes.")
 
+# Save Artefacts
+print("\n\n[3] Saving artefacts …")
 
-# ------------------------------------------------------------------------------
-# 10. Save Artefacts
-# ------------------------------------------------------------------------------
-print("\n\n[6] Saving artefacts …")
-
-# Best model
 with open(f"{OUTPUTS_DIR}/best_model.pkl", "wb") as f:
     pickle.dump(best_model_object, f)
 
-# Best model as churn_model.pkl
 with open(f"{OUTPUTS_DIR}/churn_model.pkl", "wb") as f:
     pickle.dump(best_model_object, f)
 
-# Also save all three models individually for evaluate_model.py
-for name, obj in model_objects.items():
-    safe_name = name.lower().replace(" ", "_")
-    with open(f"{OUTPUTS_DIR}/model_{safe_name}.pkl", "wb") as f:
-        pickle.dump(obj, f)
+with open(f"{OUTPUTS_DIR}/model_xgboost.pkl", "wb") as f:
+    pickle.dump(best_model_object, f)
 
-# Save metrics JSON
 metrics_output = {
-    "best_model": best_model_name,
+    "best_model": "XGBoost",
     "best_xgb_params": best_xgb_params,
     "models": all_metrics,
 }
 with open(f"{OUTPUTS_DIR}/metrics_all_models.json", "w") as f:
     json.dump(metrics_output, f, indent=2)
 
-print(f"    outputs/churn_model.pkl          -> {best_model_name}")
-print(f"    outputs/best_model.pkl           -> {best_model_name}")
-print(f"    outputs/model_logistic_regression.pkl")
-print(f"    outputs/model_random_forest.pkl")
-print(f"    outputs/model_xgboost.pkl")
+print(f"    outputs/churn_model.pkl          -> XGBoost")
+print(f"    outputs/best_model.pkl           -> XGBoost")
+print(f"    outputs/model_xgboost.pkl        -> XGBoost")
 print(f"    outputs/metrics_all_models.json")
 
 print("\n" + "=" * 70)
-print("  TRAINING COMPLETE")
-print("=" * 70)
-print("  Next step: run evaluate_model.py for full evaluation report.")
+print("  XGBOOST TRAINING COMPLETE")
 print("=" * 70)
