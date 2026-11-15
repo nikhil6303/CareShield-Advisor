@@ -224,32 +224,7 @@ npm run dev
 
 ---
 
-## 6. Optional AI Explanations via Ollama (Qwen3 1.7B)
-
-CareShield includes an optional local AI explanation service powered by **Qwen3 1.7B** running locally via **Ollama**.
-
-> **Important**: Qwen3 serves purely as an explanatory and natural language synthesis layer. It **never** replaces XGBoost or calculates churn probabilities. XGBoost remains the sole model for all churn scoring.
-
-### Setting up Ollama locally:
-1. Install [Ollama](https://ollama.com).
-2. Download the Qwen3 1.7B model:
-   ```cmd
-   ollama pull qwen3:1.7b
-   ```
-3. Start Ollama:
-   ```cmd
-   ollama serve
-   ```
-4. Configure `.env`:
-   ```env
-   OLLAMA_ENABLED=true
-   OLLAMA_HOST=http://localhost:11434
-   OLLAMA_MODEL=qwen3:1.7b
-   ```
-
----
-
-## 7. Production Deployment (Render & Vercel)
+## 6. Production Deployment (Render & Vercel)
 
 The repository is pre-configured for instant deployment on **Render.com** (Flask backend) and **Vercel** (React frontend). See [DEPLOYMENT.md](file:///c:/Users/mehta/OneDrive/Desktop/CTS_NPN/DEPLOYMENT.md) for full step-by-step instructions.
 
