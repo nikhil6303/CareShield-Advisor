@@ -28,8 +28,6 @@ import os
 import json
 import logging
 import re
-import time
-import threading
 import warnings
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -83,29 +81,6 @@ else:
             "allow_headers": ["Content-Type", "Authorization"]
         }
     })
-
-# ---------------------------------------------------------------------------
-# Simple in-memory rate limiter for expensive AI explanation endpoints.
-# Uses a token-bucket approach with no external dependencies.
-# ---------------------------------------------------------------------------
-_AI_RATE_LOCK = threading.Lock()
-_AI_RATE_CALLS: list = []      # list of timestamps of recent AI calls
-AI_RATE_LIMIT = int(os.environ.get("AI_RATE_LIMIT", "10"))   # max calls per window
-AI_RATE_WINDOW = int(os.environ.get("AI_RATE_WINDOW", "60"))  # window in seconds
-
-
-def _ai_rate_check() -> bool:
-    """Return True if the request is within the allowed rate, False if rate-limited."""
-    now = time.time()
-    with _AI_RATE_LOCK:
-        # Purge timestamps outside the current window
-        cutoff = now - AI_RATE_WINDOW
-        while _AI_RATE_CALLS and _AI_RATE_CALLS[0] < cutoff:
-            _AI_RATE_CALLS.pop(0)
-        if len(_AI_RATE_CALLS) >= AI_RATE_LIMIT:
-            return False
-        _AI_RATE_CALLS.append(now)
-        return True
 
 ALLOWED_UPLOAD_EXTENSIONS = {"csv", "xlsx", "xls"}
 REQUIRED_FEATURE_COLUMNS = [
@@ -371,105 +346,6 @@ def get_member_detail(member_id):
     if not cached:
         return jsonify({"error": f"Member with ID '{member_id}' not found."}), 404
     return jsonify(cached)
-
-
-# ------------------------------------------------------------------------------
-# Ollama / Qwen3 1.7B Local AI Explanation Endpoints
-# ------------------------------------------------------------------------------
-
-@app.route("/ai/status", methods=["GET"])
-def ai_status():
-    """
-    Returns the operational status of the local Ollama Qwen3 1.7B service.
-    Fast non-blocking check with a 2.5-second timeout.
-    """
-    from ollama_service import check_ollama_health, get_ollama_config
-    health = check_ollama_health()
-    config = get_ollama_config()
-    return jsonify({
-        "status": "online" if health.get("available") else "offline",
-        "health": health,
-        "config": config,
-        "role": "Explanation and retention advisory synthesis only (XGBoost performs all predictions)",
-    })
-
-
-@app.route("/member/<member_id>/ai-explain", methods=["POST"])
-def member_ai_explain(member_id):
-    """
-    Generates an evidence-based narrative explanation for a specific member
-    using local Qwen3 1.7B via Ollama. POST-only to prevent crawlers from
-    triggering expensive LLM inference via unintentional GET requests.
-    Does not alter XGBoost churn probability.
-    """
-    if not _ai_rate_check():
-        return jsonify({
-            "success": False,
-            "error": "AI explanation rate limit reached. Please wait before requesting another explanation."
-        }), 429
-
-    cached = MEMBER_CACHE.get(member_id)
-    if not cached:
-        return jsonify({"error": f"Member with ID '{member_id}' not found."}), 404
-
-    from ollama_service import generate_ai_explanation
-    active_ind = registry.get_active_bundle().schema.display_name
-
-    try:
-        explanation = generate_ai_explanation(
-            member_id=member_id,
-            churn_probability=cached["churn_probability"],
-            risk_level=cached["risk_level"],
-            shap_drivers=cached["drivers"],
-            member_info=cached["member_info"],
-            industry_name=active_ind,
-        )
-        return jsonify(explanation)
-    except Exception as exc:
-        logger.error("AI explanation error for member %s: %s", member_id, exc, exc_info=True)
-        return jsonify({"success": False, "error": "AI explanation service encountered an internal error."}), 500
-
-
-@app.route("/explain/ai", methods=["POST"])
-def explain_custom_ai():
-    """
-    Generates an evidence-based narrative explanation for custom/simulator member inputs.
-    Does not block or alter XGBoost predictions.
-    Rate-limited to prevent runaway LLM inference.
-    """
-    if not _ai_rate_check():
-        return jsonify({
-            "success": False,
-            "error": "AI explanation rate limit reached. Please wait before requesting another explanation."
-        }), 429
-
-    data = request.get_json(silent=True) or {}
-    prob = data.get("churn_probability")
-    risk_level = data.get("risk_level")
-    drivers = data.get("drivers", [])
-    member_info = data.get("member_info", {})
-
-    if prob is None or not risk_level:
-        return jsonify({
-            "error": "Fields 'churn_probability' and 'risk_level' are required for AI explanation."
-        }), 400
-
-    from ollama_service import generate_ai_explanation
-    active_ind = registry.get_active_bundle().schema.display_name
-
-    try:
-        explanation = generate_ai_explanation(
-            member_id=data.get("member_id"),
-            churn_probability=float(prob),
-            risk_level=str(risk_level),
-            shap_drivers=drivers,
-            member_info=member_info,
-            industry_name=active_ind,
-        )
-        return jsonify(explanation)
-    except Exception as exc:
-        logger.error("Custom AI explanation error: %s", exc, exc_info=True)
-        return jsonify({"success": False, "error": "AI explanation service encountered an internal error."}), 500
 
 
 @app.route("/analytics", methods=["GET"])

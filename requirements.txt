@@ -41,7 +41,7 @@ matplotlib==3.10.9
 openpyxl==3.1.5
 xlrd==2.0.2
 
-# --- HTTP (Ollama integration) ---
+# --- HTTP client (used by test_workflow.py) ---
 requests==2.34.2
 urllib3==2.5.0
 certifi==2025.7.14
